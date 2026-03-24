@@ -1,0 +1,51 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Project outputs
+result/
+logs/
+outputs/
+checkpoints/
+runs/
+
+# Large datasets and generated data
+GSE240429_data/
+datasets/
+data/
+
+# Model weights / large binaries
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+
+# Scientific arrays / archives
+*.npy
+*.npz
+*.mat
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
