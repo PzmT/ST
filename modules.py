@@ -1,4 +1,5 @@
 import os
+import json
 import colorsys
 from typing import Optional
 import torch
@@ -220,6 +221,80 @@ class ImageEncoder_ViT_L(nn.Module):
         )
         for p in self.model.parameters():
             p.requires_grad = trainable
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class ImageEncoder_UNI(nn.Module):
+    """
+    Local offline UNI encoder loader.
+    Requires:
+      - <model_dir>/config.json
+      - <model_dir>/pytorch_model.bin
+    """
+
+    def __init__(self, model_dir: str, trainable=CFG.trainable):
+        super().__init__()
+        if not model_dir:
+            raise ValueError("`model_dir` for UNI is empty.")
+
+        model_dir = os.path.abspath(model_dir)
+        config_path = os.path.join(model_dir, "config.json")
+        weight_path = os.path.join(model_dir, "pytorch_model.bin")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"UNI config not found: {config_path}")
+        if not os.path.exists(weight_path):
+            raise FileNotFoundError(f"UNI weights not found: {weight_path}")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            uni_cfg = json.load(f)
+
+        architecture = uni_cfg.get("architecture", "vit_large_patch16_224")
+        self.model = timm.create_model(
+            architecture,
+            pretrained=False,  # offline mode: never download at runtime
+            img_size=int(uni_cfg.get("img_size", 224)),
+            patch_size=int(uni_cfg.get("patch_size", 16)),
+            init_values=float(uni_cfg.get("init_values", 1.0)),
+            num_classes=int(uni_cfg.get("num_classes", 0)),
+            dynamic_img_size=bool(uni_cfg.get("dynamic_img_size", True)),
+            global_pool=uni_cfg.get("global_pool", "token"),
+        )
+
+        state_dict = torch.load(weight_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(
+            state_dict["state_dict"], dict
+        ):
+            state_dict = state_dict["state_dict"]
+        if not isinstance(state_dict, dict):
+            raise RuntimeError(f"Unsupported UNI checkpoint format at {weight_path}.")
+
+        try:
+            self.model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as e:
+            # Minimal compatibility path for checkpoints saved via DataParallel.
+            has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+            if not has_module_prefix:
+                raise RuntimeError(
+                    f"Failed strict UNI load from {weight_path}: {e}"
+                ) from e
+
+            stripped_state = {
+                (k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items()
+            }
+            missing, unexpected = self.model.load_state_dict(stripped_state, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "UNI compatibility load failed after stripping `module.` prefix: "
+                    f"missing={len(missing)}, unexpected={len(unexpected)}"
+                ) from e
+
+        for p in self.model.parameters():
+            p.requires_grad = trainable
+
+        self.local_model_dir = model_dir
+        self.feature_dim = int(uni_cfg.get("num_features", 1024))
 
     def forward(self, x):
         return self.model(x)
@@ -449,6 +524,75 @@ class AdaptiveRegionGenerator(nn.Module):
         return Z_HE_valid, region_indices
 
 
+class FixedGridRegionGenerator(nn.Module):
+    """
+    Deterministic fixed-grid region partition baseline.
+
+    Inputs:
+        F: (N, d) patch features from one slide
+        T: (N, 2) coordinates from one slide
+    Outputs:
+        Z_HE_valid: (V, d) mean-pooled region features
+        region_indices: (N,) compact region ids in [0, V-1]
+    """
+
+    def __init__(self, feature_dim: int, grid_size: int = 8):
+        super().__init__()
+        if feature_dim <= 0:
+            raise ValueError(f"`feature_dim` must be positive, got {feature_dim}.")
+        if grid_size <= 0:
+            raise ValueError(f"`grid_size` must be positive, got {grid_size}.")
+        self.feature_dim = int(feature_dim)
+        self.grid_size = int(grid_size)
+
+    def forward(self, F: torch.Tensor, T: torch.Tensor):
+        if F.ndim != 2:
+            raise ValueError(f"`F` must be 2D (N, d), got shape {tuple(F.shape)}.")
+        if T.ndim != 2 or T.size(-1) != 2:
+            raise ValueError(f"`T` must be 2D (N, 2), got shape {tuple(T.shape)}.")
+        if F.size(0) != T.size(0):
+            raise ValueError(
+                f"`F` and `T` must share N, got F={tuple(F.shape)}, T={tuple(T.shape)}."
+            )
+        if F.size(1) != self.feature_dim:
+            raise ValueError(
+                f"Feature dim mismatch: got F.shape[1]={F.size(1)}, "
+                f"expected {self.feature_dim}."
+            )
+
+        N, d = F.shape
+        if N == 0:
+            empty_z = F.new_zeros(0, d)
+            empty_idx = torch.empty(0, dtype=torch.long, device=F.device)
+            return empty_z, empty_idx
+
+        T = T.to(dtype=F.dtype)
+        k = self.grid_size
+        eps = torch.finfo(T.dtype).eps
+
+        t_min = T.min(dim=0).values
+        t_max = T.max(dim=0).values
+        span = (t_max - t_min).clamp_min(eps)
+
+        x_edges = torch.linspace(t_min[0], t_min[0] + span[0], steps=k + 1, device=F.device, dtype=T.dtype)
+        y_edges = torch.linspace(t_min[1], t_min[1] + span[1], steps=k + 1, device=F.device, dtype=T.dtype)
+
+        x_bin = torch.bucketize(T[:, 0].contiguous(), x_edges[1:-1], right=False)
+        y_bin = torch.bucketize(T[:, 1].contiguous(), y_edges[1:-1], right=False)
+        raw_region_ids = x_bin * k + y_bin
+
+        _, region_indices = torch.unique(raw_region_ids, sorted=True, return_inverse=True)
+        V = int(region_indices.max().item()) + 1
+
+        z_he_valid = F.new_zeros(V, d)
+        counts = F.new_zeros(V)
+        z_he_valid.index_add_(0, region_indices, F)
+        counts.index_add_(0, region_indices, F.new_ones(N))
+        z_he_valid = z_he_valid / counts.clamp_min(1.0).unsqueeze(-1)
+
+        return z_he_valid, region_indices
+
+
 class DualHypergraphAligner(nn.Module):
     """
     Dual-hypergraph co-alignment module for HE-ST topology-level matching.
@@ -495,6 +639,16 @@ class DualHypergraphAligner(nn.Module):
         self.he_proj = nn.Linear(he_dim, d_out, bias=False)  # W^p
         self.st_proj = nn.Linear(st_dim, d_out, bias=False)  # W^g
         self.act = nn.GELU()
+
+    def _ddp_safe_zero_align_loss(self, ref_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Build a zero loss that is explicitly attached to all DualHG params.
+        This keeps DDP backward graphs consistent when a local slide/batch is invalid.
+        """
+        zero = ref_tensor.sum() * 0.0
+        for p in self.parameters():
+            zero = zero + p.sum() * 0.0
+        return zero
 
     def _build_incidence_knn(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -601,7 +755,7 @@ class DualHypergraphAligner(nn.Module):
 
         # Step 4: symmetric InfoNCE over valid region pairs.
         if len(z_he_list) < 2:
-            align_loss = self.he_proj.weight.sum() * 0.0
+            align_loss = self._ddp_safe_zero_align_loss(F)
             if return_details:
                 empty = F.new_zeros(0, self.d_out)
                 return align_loss, {

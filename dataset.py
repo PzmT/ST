@@ -1,10 +1,62 @@
-import cv2
 import numpy as np
 import pandas as pd
 import torch
-import torchvision.transforms.functional as TF
 from PIL import Image
 import random
+import os
+import re
+
+def _hflip_pil(image: Image.Image) -> Image.Image:
+    return image.transpose(Image.FLIP_LEFT_RIGHT)
+
+
+def _vflip_pil(image: Image.Image) -> Image.Image:
+    return image.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def _rotate_pil(image: Image.Image, angle_degrees: int) -> Image.Image:
+    # For multiples of 90 degrees, PIL keeps the original size.
+    # Using bilinear interpolation is safe for general angles too.
+    return image.rotate(angle_degrees, resample=Image.BILINEAR)
+
+
+def _to_tensor_pil(image: Image.Image) -> torch.Tensor:
+    # Convert uint8 RGB (H, W, C) -> float tensor (C, H, W) in [0, 1]
+    arr = np.array(image, dtype=np.uint8)
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float().div(255.0)
+    return t
+
+
+def _normalize_tensor(t: torch.Tensor, mean, std) -> torch.Tensor:
+    # mean/std are 3-element lists in RGB order.
+    mean_t = torch.tensor(mean, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    std_t = torch.tensor(std, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    return t.sub(mean_t).div(std_t)
+
+
+def _infer_slide_id(image_path: str) -> str:
+    """
+    从图像文件名推断稳定的切片 ID（如 C73_A1）。
+    若推断失败，回退到去扩展名文件名，保证可复现。
+    """
+    stem = os.path.splitext(os.path.basename(str(image_path)))[0]
+    upper = stem.upper()
+
+    match = re.search(r"C73_([ABCD]1)", upper)
+    if match is not None:
+        return f"C73_{match.group(1)}"
+
+    token_map = {
+        "A1": "C73_A1",
+        "B1": "C73_B1",
+        "C1": "C73_C1",
+        "D1": "C73_D1",
+    }
+    for token, slide_id in token_map.items():
+        if token in upper:
+            return slide_id
+
+    return stem
 
 
 class CLIPDataset(torch.utils.data.Dataset):
@@ -16,11 +68,14 @@ class CLIPDataset(torch.utils.data.Dataset):
         reduced_mtx_path,
         is_train: bool = True,
         patch_size: int = 224,
+        slide_id: str = None,
     ):
         # image_path 是整张切片级高分辨率图像
-        self.whole_image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if self.whole_image is None:
-            raise FileNotFoundError(f"Failed to load image: {image_path}")
+        try:
+            # Keep everything in RGB to avoid cv2 dependency.
+            self.whole_image = np.array(Image.open(image_path).convert("RGB"))
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to load image: {image_path}") from e
 
         self.image_h, self.image_w = self.whole_image.shape[:2]
         self.patch_size = int(patch_size)
@@ -59,6 +114,7 @@ class CLIPDataset(torch.utils.data.Dataset):
         self.barcodes = self.barcode_tsv[0].tolist()
         self.reduced_matrix = self.reduced_matrix.astype(np.float32, copy=False)
         self.is_train = is_train
+        self.slide_id = str(slide_id) if slide_id is not None else _infer_slide_id(image_path)
 
         print("Finished loading all files")
 
@@ -68,15 +124,19 @@ class CLIPDataset(torch.utils.data.Dataset):
         if self.is_train:
             # 训练时开启随机翻转 + 90 度旋转增强
             if random.random() > 0.5:
-                image = TF.hflip(image)
+                image = _hflip_pil(image)
             if random.random() > 0.5:
-                image = TF.vflip(image)
+                image = _vflip_pil(image)
 
             angle = random.choice([180, 90, 0, -90])
-            image = TF.rotate(image, angle)
+            image = _rotate_pil(image, angle)
 
-        image = TF.to_tensor(image)
-        image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        image = _to_tensor_pil(image)
+        image = _normalize_tensor(
+            image,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
         return image
 
     def _crop_patch_with_padding(self, center_y: float, center_x: float) -> np.ndarray:
@@ -116,10 +176,7 @@ class CLIPDataset(torch.utils.data.Dataset):
         barcode = self.barcodes[idx]
         v1, v2 = self.spatial_coords[idx]  # v1: y, v2: x
 
-        patch_bgr = self._crop_patch_with_padding(v1, v2)
-        # OpenCV 读入是 BGR，转成 RGB 再喂给 PIL/torchvision
-        patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
-
+        patch_rgb = self._crop_patch_with_padding(v1, v2)
         image = self.transform(patch_rgb)
 
         # 防御式检查：无论边界如何，shape 必须稳定为 (3, 224, 224)
@@ -133,6 +190,7 @@ class CLIPDataset(torch.utils.data.Dataset):
         item["reduced_expression"] = torch.tensor(self.reduced_matrix[idx, :], dtype=torch.float32)
         item["barcode"] = barcode
         item["spatial_coords"] = torch.tensor([v1, v2], dtype=torch.float32)
+        item["slide_id"] = self.slide_id
 
         return item
 

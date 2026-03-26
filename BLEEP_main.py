@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -17,10 +17,11 @@ from models import (
     CLIPModel_ViT,
     CLIPModel_ViT_L,
     CLIPModel_CLIP,
+    CLIPModel_UNI,
     CLIPModel_resnet101,
     CLIPModel_resnet152,
 )
-from modules import AdaptiveRegionGenerator, DualHypergraphAligner
+from modules import AdaptiveRegionGenerator, DualHypergraphAligner, FixedGridRegionGenerator
 from utils import AvgMeter, get_lr
 
 
@@ -36,8 +37,50 @@ parser.add_argument("--world_size", default=1, type=int, help="number of process
 parser.add_argument("--distributed", action="store_true", help="force distributed training")
 
 parser.add_argument("--model", type=str, default="resnet50", help="image encoder type")
+parser.add_argument(
+    "--uni_model_dir",
+    type=str,
+    default="/root/disk2/runzhi/BLEEP/UNI_Offline_Model",
+    help="local offline UNI checkpoint directory (contains config.json and pytorch_model.bin)",
+)
+parser.add_argument(
+    "--use_spot_encoder",
+    action="store_true",
+    default=CFG.use_spot_encoder,
+    help="enable optional SpotEncoder tower (default: off for BLEEP-like baseline path)",
+)
+parser.add_argument(
+    "--train_slides",
+    type=str,
+    default="1,2",
+    help='comma-separated train slide ids, e.g. "1,2,4"',
+)
+parser.add_argument(
+    "--val_slides",
+    type=str,
+    default="4",
+    help='comma-separated val slide ids, e.g. "3"',
+)
+parser.add_argument(
+    "--test_slides",
+    type=str,
+    default="3",
+    help='comma-separated test slide ids for explicit split bookkeeping',
+)
 
-parser.add_argument("--use_arg", action="store_true", help="enable AdaptiveRegionGenerator")
+parser.add_argument(
+    "--region_mode",
+    type=str,
+    choices=["none", "fixed", "adaptive"],
+    default="none",
+    help="region generator mode: none (baseline), fixed (k x k deterministic), adaptive (ARG)",
+)
+parser.add_argument("--fixed_grid_size", type=int, default=8, help="fixed-grid baseline size k")
+parser.add_argument(
+    "--use_arg",
+    action="store_true",
+    help=argparse.SUPPRESS,  # deprecated: kept for backward compatibility
+)
 parser.add_argument("--arg_grid_size", type=int, default=8, help="ARG grid size k")
 parser.add_argument("--arg_topk", type=int, default=3, help="ARG top-k candidates")
 parser.add_argument("--arg_heads", type=int, default=8, help="ARG ARSA attention heads")
@@ -49,6 +92,44 @@ parser.add_argument("--dual_hg_radius", type=float, default=150.0, help="ST reca
 parser.add_argument("--dual_hg_k", type=int, default=5, help="hypergraph KNN neighbors")
 parser.add_argument("--dual_hg_temp", type=float, default=0.07, help="InfoNCE temperature")
 parser.add_argument("--dual_hg_weight", type=float, default=1.0, help="weight for L_align")
+parser.add_argument(
+    "--spatial_debug_interval",
+    type=int,
+    default=0,
+    help="if > 0, print spatial branch debug every N train/val steps on rank 0",
+)
+
+
+SLIDE_META = {
+    "1": {
+        "slide_id": "C73_A1",
+        "image": "images/GEX_C73_A1_Merged.tif",
+        "spatial_pos": "data/tissue_pos_matrices/tissue_positions_list_1.csv",
+        "reduced_mtx": "data/filtered_expression_matrices/1/harmony_matrix.npy",
+        "barcode": "data/filtered_expression_matrices/1/barcodes.tsv",
+    },
+    "2": {
+        "slide_id": "C73_B1",
+        "image": "images/GEX_C73_B1_Merged.tif",
+        "spatial_pos": "data/tissue_pos_matrices/tissue_positions_list_2.csv",
+        "reduced_mtx": "data/filtered_expression_matrices/2/harmony_matrix.npy",
+        "barcode": "data/filtered_expression_matrices/2/barcodes.tsv",
+    },
+    "3": {
+        "slide_id": "C73_C1",
+        "image": "images/GEX_C73_C1_Merged.tif",
+        "spatial_pos": "data/tissue_pos_matrices/tissue_positions_list_3.csv",
+        "reduced_mtx": "data/filtered_expression_matrices/3/harmony_matrix.npy",
+        "barcode": "data/filtered_expression_matrices/3/barcodes.tsv",
+    },
+    "4": {
+        "slide_id": "C73_D1",
+        "image": "images/GEX_C73_D1_Merged.tif",
+        "spatial_pos": "data/tissue_pos_matrices/tissue_positions_list_4.csv",
+        "reduced_mtx": "data/filtered_expression_matrices/4/harmony_matrix.npy",
+        "barcode": "data/filtered_expression_matrices/4/barcodes.tsv",
+    },
+}
 
 
 def _is_dist_initialized() -> bool:
@@ -62,7 +143,7 @@ def _is_main_process() -> bool:
 def _get_image_feature_dim(model_name: str) -> int:
     if model_name in ("clip", "vit"):
         return 768
-    if model_name == "vit_l":
+    if model_name in ("vit_l", "uni"):
         return 1024
     return 2048
 
@@ -159,41 +240,49 @@ def _init_distributed(args):
 
 
 def build_loaders(args):
-    """
-    数据切分策略（关键修复）：
-    - 训练集：dataset1 + dataset2（切片级拼接）
-    - 验证集：dataset4（独立切片）
-
-    这样可彻底避免同一物理切片内 spot 级 random_split 带来的空间泄漏。
-    """
     base_dir = os.path.join(os.path.dirname(__file__), "GSE240429_data")
 
-    dataset1_train = CLIPDataset(
-        image_path=os.path.join(base_dir, "images/GEX_C73_A1_Merged.tif"),
-        spatial_pos_path=os.path.join(base_dir, "data/tissue_pos_matrices/tissue_positions_list_1.csv"),
-        reduced_mtx_path=os.path.join(base_dir, "data/filtered_expression_matrices/1/harmony_matrix.npy"),
-        barcode_path=os.path.join(base_dir, "data/filtered_expression_matrices/1/barcodes.tsv"),
-        is_train=True,
-    )
-    dataset2_train = CLIPDataset(
-        image_path=os.path.join(base_dir, "images/GEX_C73_B1_Merged.tif"),
-        spatial_pos_path=os.path.join(base_dir, "data/tissue_pos_matrices/tissue_positions_list_2.csv"),
-        reduced_mtx_path=os.path.join(base_dir, "data/filtered_expression_matrices/2/harmony_matrix.npy"),
-        barcode_path=os.path.join(base_dir, "data/filtered_expression_matrices/2/barcodes.tsv"),
-        is_train=True,
-    )
-    dataset4_val = CLIPDataset(
-        image_path=os.path.join(base_dir, "images/GEX_C73_D1_Merged.tif"),
-        spatial_pos_path=os.path.join(base_dir, "data/tissue_pos_matrices/tissue_positions_list_4.csv"),
-        reduced_mtx_path=os.path.join(base_dir, "data/filtered_expression_matrices/4/harmony_matrix.npy"),
-        barcode_path=os.path.join(base_dir, "data/filtered_expression_matrices/4/barcodes.tsv"),
-        is_train=False,
-    )
+    def _parse_slide_list(raw_value: str, arg_name: str) -> List[str]:
+        ids = [x.strip() for x in str(raw_value).split(",") if x.strip()]
+        if not ids:
+            raise ValueError(f"`{arg_name}` is empty. Please provide at least one slide id.")
+        invalid = [x for x in ids if x not in SLIDE_META]
+        if invalid:
+            raise ValueError(
+                f"`{arg_name}` has invalid ids {invalid}. Valid ids are {sorted(SLIDE_META.keys())}."
+            )
+        return ids
 
-    train_dataset = ConcatDataset([dataset1_train, dataset2_train])
-    val_dataset = dataset4_val
+    def _build_dataset_for_slide(slide_num: str, is_train: bool) -> CLIPDataset:
+        slide_meta = SLIDE_META[slide_num]
+        return CLIPDataset(
+            image_path=os.path.join(base_dir, slide_meta["image"]),
+            spatial_pos_path=os.path.join(base_dir, slide_meta["spatial_pos"]),
+            reduced_mtx_path=os.path.join(base_dir, slide_meta["reduced_mtx"]),
+            barcode_path=os.path.join(base_dir, slide_meta["barcode"]),
+            slide_id=slide_meta["slide_id"],
+            is_train=is_train,
+        )
+
+    train_slide_nums = _parse_slide_list(args.train_slides, "train_slides")
+    val_slide_nums = _parse_slide_list(args.val_slides, "val_slides")
+    test_slide_nums = _parse_slide_list(args.test_slides, "test_slides")
+
+    train_sets = [_build_dataset_for_slide(slide_num, is_train=True) for slide_num in train_slide_nums]
+    val_sets = [_build_dataset_for_slide(slide_num, is_train=False) for slide_num in val_slide_nums]
+
+    train_dataset = train_sets[0] if len(train_sets) == 1 else ConcatDataset(train_sets)
+    val_dataset = val_sets[0] if len(val_sets) == 1 else ConcatDataset(val_sets)
 
     if _is_main_process():
+        train_slide_ids = [SLIDE_META[x]["slide_id"] for x in train_slide_nums]
+        val_slide_ids = [SLIDE_META[x]["slide_id"] for x in val_slide_nums]
+        test_slide_ids = [SLIDE_META[x]["slide_id"] for x in test_slide_nums]
+        print(
+            f"Slide split configured | train={train_slide_nums} ({train_slide_ids}) "
+            f"| val={val_slide_nums} ({val_slide_ids}) | test={test_slide_nums} ({test_slide_ids})",
+            flush=True,
+        )
         print(f"Train samples={len(train_dataset)}, Val samples={len(val_dataset)}", flush=True)
 
     # 关键修复：训练/验证都使用 DistributedSampler
@@ -244,26 +333,44 @@ def build_loaders(args):
 
 def _build_model(args, device: torch.device):
     if args.model == "clip":
-        model = CLIPModel_CLIP().to(device)
+        model = CLIPModel_CLIP(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "CLIP"
     elif args.model == "vit":
-        model = CLIPModel_ViT().to(device)
+        model = CLIPModel_ViT(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "ViT"
     elif args.model == "vit_l":
-        model = CLIPModel_ViT_L().to(device)
+        model = CLIPModel_ViT_L(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "ViT-L"
+    elif args.model == "uni":
+        model = CLIPModel_UNI(
+            uni_model_dir=args.uni_model_dir,
+            use_spot_encoder=args.use_spot_encoder,
+        ).to(device)
+        model_name = "UNI(local)"
     elif args.model == "resnet101":
-        model = CLIPModel_resnet101().to(device)
+        model = CLIPModel_resnet101(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "ResNet101"
     elif args.model == "resnet152":
-        model = CLIPModel_resnet152().to(device)
+        model = CLIPModel_resnet152(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "ResNet152"
     else:
-        model = CLIPModel().to(device)
+        model = CLIPModel(use_spot_encoder=args.use_spot_encoder).to(device)
         model_name = "ResNet50"
 
     if _is_main_process():
-        print(f"Image encoder is {model_name}", flush=True)
+        if args.model == "uni":
+            print(
+                "Image encoder config | model=uni, "
+                f"use_spot_encoder={bool(args.use_spot_encoder)}, "
+                f"uni_model_dir={os.path.abspath(args.uni_model_dir)}, "
+                f"image_feature_dim={_get_image_feature_dim(args.model)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Image encoder is {model_name}, use_spot_encoder={bool(args.use_spot_encoder)}",
+                flush=True,
+            )
 
     if args.distributed:
         model = nn.parallel.DistributedDataParallel(
@@ -293,16 +400,139 @@ def _all_gather_avg_loss(local_sum: float, local_count: int, device: torch.devic
     return (total_sum / total_count).item()
 
 
+def _normalize_slide_ids(slide_ids, expected_batch: int) -> List[str]:
+    if isinstance(slide_ids, (list, tuple)):
+        ids = [str(x) for x in slide_ids]
+    elif torch.is_tensor(slide_ids):
+        if slide_ids.ndim != 1:
+            raise ValueError(f"`slide_id` tensor must be 1D, got shape {tuple(slide_ids.shape)}")
+        ids = [str(x.item()) for x in slide_ids]
+    else:
+        raise ValueError(f"Unsupported `slide_id` type: {type(slide_ids)}")
+
+    if len(ids) != expected_batch:
+        raise ValueError(
+            f"`slide_id` batch size mismatch: got {len(ids)}, expected {expected_batch}."
+        )
+    return ids
+
+
+def _ddp_safe_zero_align_from_module(
+    module: Optional[nn.Module], ref_tensor: torch.Tensor
+) -> torch.Tensor:
+    """
+    Build a zero-valued align loss that still references all aligner params.
+    This avoids DDP graph mismatch when local spatial fragments are invalid/skipped.
+    """
+    zero = ref_tensor.sum() * 0.0
+    if module is None:
+        return zero
+    for p in module.parameters():
+        zero = zero + p.sum() * 0.0
+    return zero
+
+
+def _run_spatial_branch(
+    *,
+    args,
+    batch,
+    image_features: torch.Tensor,
+    reduced_expression: torch.Tensor,
+    device: torch.device,
+    region_generator: nn.Module,
+    dual_hg_aligner: Optional[nn.Module],
+):
+    if "slide_id" not in batch:
+        raise ValueError(
+            "Spatial modules require `slide_id` in batch. "
+            "Please update dataset/collate to return per-sample slide identity."
+        )
+    if region_generator is None:
+        raise ValueError("`region_generator` is None while spatial branch is enabled.")
+    if args.use_dual_hg and dual_hg_aligner is None:
+        raise ValueError("`dual_hg_aligner` is None while `--use_dual_hg` is enabled.")
+
+    coords = _extract_spatial_coords(batch["spatial_coords"], device=device)
+    slide_ids = _normalize_slide_ids(batch["slide_id"], expected_batch=image_features.size(0))
+
+    grouped_indices: Dict[str, List[int]] = {}
+    for i, slide_id in enumerate(slide_ids):
+        grouped_indices.setdefault(slide_id, []).append(i)
+
+    region_count = 0
+    region_count_by_slide: Dict[str, int] = {}
+    align_terms: List[torch.Tensor] = []
+    skipped_dual_hg = 0
+    valid_dual_hg_slides = 0
+
+    for slide_id, idx_list in grouped_indices.items():
+        if any(slide_ids[i] != slide_id for i in idx_list):
+            raise RuntimeError("Internal error: cross-slide index grouping failed.")
+
+        idx_tensor = torch.as_tensor(idx_list, dtype=torch.long, device=device)
+        image_features_i = image_features.index_select(0, idx_tensor)
+        reduced_expression_i = reduced_expression.index_select(0, idx_tensor)
+        coords_i = coords.index_select(0, idx_tensor)
+
+        # 区域分配器在本轮用于构建 region indices，不参与梯度更新。
+        with torch.no_grad():
+            z_he_valid, region_indices = region_generator(image_features_i.detach(), coords_i)
+        slide_region_count = int(z_he_valid.size(0))
+        region_count_by_slide[str(slide_id)] = slide_region_count
+        region_count += slide_region_count
+
+        if args.use_dual_hg:
+            zero_slide_align = _ddp_safe_zero_align_from_module(dual_hg_aligner, image_features_i)
+            if image_features_i.size(0) < 2:
+                # 样本太少的 slide 子集不参与 DualHG，避免构图退化。
+                skipped_dual_hg += 1
+                align_terms.append(zero_slide_align)
+                continue
+
+            slide_align = dual_hg_aligner(
+                F=image_features_i,
+                T=coords_i,
+                region_indices=region_indices,
+                E=reduced_expression_i,
+                S=coords_i,
+            )
+
+            if torch.isfinite(slide_align).all():
+                align_terms.append(slide_align)
+                valid_dual_hg_slides += 1
+            else:
+                skipped_dual_hg += 1
+                align_terms.append(zero_slide_align)
+
+    align_loss = None
+    if args.use_dual_hg:
+        if align_terms:
+            align_loss = torch.stack(align_terms).mean()
+        else:
+            align_loss = _ddp_safe_zero_align_from_module(dual_hg_aligner, image_features)
+
+    return {
+        "align_loss": align_loss,
+        "region_count": region_count,
+        "region_count_by_slide": region_count_by_slide,
+        "num_slides": len(grouped_indices),
+        "skipped_dual_hg": skipped_dual_hg,
+        "valid_dual_hg_slides": valid_dual_hg_slides,
+    }
+
+
 def train_epoch(
     model,
     train_loader,
     optimizer,
     args,
     device: torch.device,
-    arg_generator: Optional[AdaptiveRegionGenerator] = None,
+    region_generator: Optional[nn.Module] = None,
     dual_hg_aligner: Optional[nn.Module] = None,
 ):
     loss_meter = AvgMeter("train_loss")
+    batch_regions_meter = AvgMeter("train_batch_regions")
+    slide_regions_meter = AvgMeter("train_slide_regions")
     progress = tqdm(
         train_loader,
         total=len(train_loader),
@@ -310,12 +540,12 @@ def train_epoch(
         leave=False,
     )
 
-    for batch in progress:
+    for step_idx, batch in enumerate(progress):
         image = batch["image"].to(device, non_blocking=True)
         reduced_expression = batch["reduced_expression"].to(device, non_blocking=True)
         model_batch = {"image": image, "reduced_expression": reduced_expression}
 
-        need_features = args.use_arg or args.use_dual_hg
+        need_features = args.region_mode != "none"
         forward_out = model(model_batch, return_features=need_features)
 
         if need_features:
@@ -327,23 +557,45 @@ def train_epoch(
 
         loss = clip_loss
         align_loss = None
-        arg_region_count = None
+        region_count = None
+        skipped_dual_hg = 0
 
         if need_features:
-            coords = _extract_spatial_coords(batch["spatial_coords"], device=device)
-            with torch.no_grad():
-                z_he_valid, region_indices = arg_generator(image_features.detach(), coords)
-                arg_region_count = int(z_he_valid.size(0))
+            spatial_out = _run_spatial_branch(
+                args=args,
+                batch=batch,
+                image_features=image_features,
+                reduced_expression=reduced_expression,
+                device=device,
+                region_generator=region_generator,
+                dual_hg_aligner=dual_hg_aligner,
+            )
+            region_count = spatial_out["region_count"]
+            region_count_by_slide = spatial_out["region_count_by_slide"]
+            skipped_dual_hg = spatial_out["skipped_dual_hg"]
+            valid_dual_hg_slides = spatial_out["valid_dual_hg_slides"]
+            batch_regions_meter.update(float(region_count), 1)
+            for _, slide_region_count in region_count_by_slide.items():
+                slide_regions_meter.update(float(slide_region_count), 1)
 
             if args.use_dual_hg:
-                align_loss = dual_hg_aligner(
-                    F=image_features,
-                    T=coords,
-                    region_indices=region_indices,
-                    E=reduced_expression,
-                    S=coords,
-                )
+                align_loss = spatial_out["align_loss"]
                 loss = clip_loss + args.dual_hg_weight * align_loss
+
+            if _is_main_process():
+                debug_every = int(args.spatial_debug_interval)
+                should_log_debug = (debug_every > 0 and step_idx % debug_every == 0) or (
+                    args.use_dual_hg and skipped_dual_hg > 0
+                )
+                if should_log_debug:
+                    print(
+                        f"[SpatialDebug][train][step={step_idx}] "
+                        f"region_mode={args.region_mode}, "
+                        f"valid_spatial_slides={valid_dual_hg_slides}, "
+                        f"skipped_dual_hg={skipped_dual_hg}, "
+                        f"region_count_by_slide={region_count_by_slide}",
+                        flush=True,
+                    )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -355,15 +607,16 @@ def train_epoch(
         bs = image.size(0)
         loss_meter.update(loss.item(), bs)
 
-        if align_loss is None and arg_region_count is None:
+        if align_loss is None and region_count is None:
             progress.set_postfix(train_loss=loss_meter.avg, lr=get_lr(optimizer))
         elif align_loss is None:
             progress.set_postfix(
                 train_loss=loss_meter.avg,
                 lr=get_lr(optimizer),
-                arg_regions=arg_region_count,
+                regions=region_count,
+                mean_regions=slide_regions_meter.avg if slide_regions_meter.count > 0 else 0.0,
             )
-        elif arg_region_count is None:
+        elif region_count is None:
             progress.set_postfix(
                 train_loss=loss_meter.avg,
                 lr=get_lr(optimizer),
@@ -374,12 +627,14 @@ def train_epoch(
             progress.set_postfix(
                 train_loss=loss_meter.avg,
                 lr=get_lr(optimizer),
-                arg_regions=arg_region_count,
+                regions=region_count,
+                mean_regions=slide_regions_meter.avg if slide_regions_meter.count > 0 else 0.0,
+                skipped_dual_hg=skipped_dual_hg,
                 clip_loss=float(clip_loss.detach().item()),
                 align_loss=float(align_loss.detach().item()),
             )
 
-    return loss_meter
+    return loss_meter, batch_regions_meter, slide_regions_meter
 
 
 def val_epoch(
@@ -387,10 +642,12 @@ def val_epoch(
     val_loader,
     args,
     device: torch.device,
-    arg_generator: Optional[AdaptiveRegionGenerator] = None,
+    region_generator: Optional[nn.Module] = None,
     dual_hg_aligner: Optional[nn.Module] = None,
 ):
     loss_meter = AvgMeter("val_loss")
+    batch_regions_meter = AvgMeter("val_batch_regions")
+    slide_regions_meter = AvgMeter("val_slide_regions")
     local_sum = 0.0
     local_count = 0
 
@@ -401,12 +658,12 @@ def val_epoch(
         leave=False,
     )
 
-    for batch in progress:
+    for step_idx, batch in enumerate(progress):
         image = batch["image"].to(device, non_blocking=True)
         reduced_expression = batch["reduced_expression"].to(device, non_blocking=True)
         model_batch = {"image": image, "reduced_expression": reduced_expression}
 
-        need_features = args.use_arg or args.use_dual_hg
+        need_features = args.region_mode != "none"
         forward_out = model(model_batch, return_features=need_features)
 
         if need_features:
@@ -418,33 +675,60 @@ def val_epoch(
 
         loss = clip_loss
         align_loss = None
-        arg_region_count = None
+        region_count = None
+        skipped_dual_hg = 0
 
         if need_features:
-            coords = _extract_spatial_coords(batch["spatial_coords"], device=device)
-            z_he_valid, region_indices = arg_generator(image_features, coords)
-            arg_region_count = int(z_he_valid.size(0))
+            spatial_out = _run_spatial_branch(
+                args=args,
+                batch=batch,
+                image_features=image_features,
+                reduced_expression=reduced_expression,
+                device=device,
+                region_generator=region_generator,
+                dual_hg_aligner=dual_hg_aligner,
+            )
+            region_count = spatial_out["region_count"]
+            region_count_by_slide = spatial_out["region_count_by_slide"]
+            skipped_dual_hg = spatial_out["skipped_dual_hg"]
+            valid_dual_hg_slides = spatial_out["valid_dual_hg_slides"]
+            batch_regions_meter.update(float(region_count), 1)
+            for _, slide_region_count in region_count_by_slide.items():
+                slide_regions_meter.update(float(slide_region_count), 1)
 
             if args.use_dual_hg:
-                align_loss = dual_hg_aligner(
-                    F=image_features,
-                    T=coords,
-                    region_indices=region_indices,
-                    E=reduced_expression,
-                    S=coords,
-                )
+                align_loss = spatial_out["align_loss"]
                 loss = clip_loss + args.dual_hg_weight * align_loss
+
+            if _is_main_process():
+                debug_every = int(args.spatial_debug_interval)
+                should_log_debug = (debug_every > 0 and step_idx % debug_every == 0) or (
+                    args.use_dual_hg and skipped_dual_hg > 0
+                )
+                if should_log_debug:
+                    print(
+                        f"[SpatialDebug][val][step={step_idx}] "
+                        f"region_mode={args.region_mode}, "
+                        f"valid_spatial_slides={valid_dual_hg_slides}, "
+                        f"skipped_dual_hg={skipped_dual_hg}, "
+                        f"region_count_by_slide={region_count_by_slide}",
+                        flush=True,
+                    )
 
         bs = image.size(0)
         loss_meter.update(loss.item(), bs)
         local_sum += float(loss.item()) * bs
         local_count += bs
 
-        if align_loss is None and arg_region_count is None:
+        if align_loss is None and region_count is None:
             progress.set_postfix(val_loss=loss_meter.avg)
         elif align_loss is None:
-            progress.set_postfix(val_loss=loss_meter.avg, arg_regions=arg_region_count)
-        elif arg_region_count is None:
+            progress.set_postfix(
+                val_loss=loss_meter.avg,
+                regions=region_count,
+                mean_regions=slide_regions_meter.avg if slide_regions_meter.count > 0 else 0.0,
+            )
+        elif region_count is None:
             progress.set_postfix(
                 val_loss=loss_meter.avg,
                 clip_loss=float(clip_loss.detach().item()),
@@ -453,13 +737,15 @@ def val_epoch(
         else:
             progress.set_postfix(
                 val_loss=loss_meter.avg,
-                arg_regions=arg_region_count,
+                regions=region_count,
+                mean_regions=slide_regions_meter.avg if slide_regions_meter.count > 0 else 0.0,
+                skipped_dual_hg=skipped_dual_hg,
                 clip_loss=float(clip_loss.detach().item()),
                 align_loss=float(align_loss.detach().item()),
             )
 
     global_avg = _all_gather_avg_loss(local_sum=local_sum, local_count=local_count, device=device)
-    return loss_meter, global_avg
+    return loss_meter, global_avg, batch_regions_meter, slide_regions_meter
 
 
 def _unwrap_model(model):
@@ -475,31 +761,75 @@ def cleanup():
 def main():
     args = parser.parse_args()
 
-    if args.use_dual_hg and not args.use_arg:
-        raise ValueError("`--use_dual_hg` requires `--use_arg` because DualHG uses ARG region indices.")
+    # Backward compatibility: map deprecated --use_arg to region_mode=adaptive.
+    if args.use_arg:
+        if args.region_mode == "none":
+            args.region_mode = "adaptive"
+            if _is_main_process():
+                print("[Deprecated] `--use_arg` is mapped to `--region_mode adaptive`.", flush=True)
+        elif args.region_mode != "adaptive":
+            raise ValueError(
+                "Conflicting args: `--use_arg` implies adaptive mode, "
+                f"but got `--region_mode {args.region_mode}`."
+            )
+
+    if args.region_mode == "none" and args.use_dual_hg:
+        raise ValueError("`--use_dual_hg` requires `--region_mode fixed` or `--region_mode adaptive`.")
+    if args.region_mode not in ("none", "fixed", "adaptive"):
+        raise ValueError(f"Unsupported region_mode: {args.region_mode}")
 
     device = _init_distributed(args)
     torch.backends.cudnn.benchmark = True
 
+    if _is_main_process():
+        if args.region_mode == "fixed":
+            region_cfg = f"fixed(grid_size={args.fixed_grid_size})"
+        elif args.region_mode == "adaptive":
+            region_cfg = f"adaptive(arg_grid_size={args.arg_grid_size}, arg_topk={args.arg_topk})"
+        else:
+            region_cfg = "none"
+        print(
+            f"Experiment config | region_mode={region_cfg} | dual_hg={bool(args.use_dual_hg)}",
+            flush=True,
+        )
+
     model = _build_model(args, device)
 
-    arg_generator = None
-    if args.use_arg:
+    region_generator = None
+    if args.region_mode == "fixed":
+        fixed_feature_dim = _get_image_feature_dim(args.model)
+        region_generator = FixedGridRegionGenerator(
+            feature_dim=fixed_feature_dim,
+            grid_size=args.fixed_grid_size,
+        ).to(device)
+        region_generator.requires_grad_(False)
+        region_generator.eval()
+        if _is_main_process():
+            print(
+                f"Region mode=fixed | feature_dim={fixed_feature_dim}, grid_size={args.fixed_grid_size}, "
+                "aggregator=mean_pool",
+                flush=True,
+            )
+    elif args.region_mode == "adaptive":
         arg_feature_dim = _get_image_feature_dim(args.model)
-        arg_generator = AdaptiveRegionGenerator(
+        region_generator = AdaptiveRegionGenerator(
             feature_dim=arg_feature_dim,
             grid_size=args.arg_grid_size,
             topk=args.arg_topk,
             arsa_num_heads=args.arg_heads,
             arsa_dropout=args.arg_dropout,
         ).to(device)
-        arg_generator.eval()
+        region_generator.requires_grad_(False)
+        region_generator.eval()
         if _is_main_process():
             print(
-                f"ARG enabled: feature_dim={arg_feature_dim}, grid_size={args.arg_grid_size}, "
+                f"Region mode=adaptive(ARG) | feature_dim={arg_feature_dim}, grid_size={args.arg_grid_size}, "
                 f"topk={args.arg_topk}, heads={args.arg_heads}, dropout={args.arg_dropout}",
                 flush=True,
             )
+    else:
+        if _is_main_process():
+            print("Region mode=none | baseline BLEEP path", flush=True)
 
     dual_hg_aligner = None
     if args.use_dual_hg:
@@ -529,6 +859,8 @@ def main():
                 f"k={args.dual_hg_k}, temp={args.dual_hg_temp}, weight={args.dual_hg_weight}",
                 flush=True,
             )
+    elif _is_main_process():
+        print("DualHG disabled", flush=True)
 
     train_loader, val_loader = build_loaders(args)
 
@@ -559,13 +891,13 @@ def main():
         if dual_hg_aligner is not None:
             dual_hg_aligner.train()
 
-        train_loss = train_epoch(
+        train_loss, train_batch_regions_meter, train_slide_regions_meter = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
             args=args,
             device=device,
-            arg_generator=arg_generator,
+            region_generator=region_generator,
             dual_hg_aligner=dual_hg_aligner,
         )
 
@@ -574,23 +906,38 @@ def main():
             dual_hg_aligner.eval()
 
         with torch.no_grad():
-            val_loss_local, val_loss_global = val_epoch(
+            val_loss_local, val_loss_global, val_batch_regions_meter, val_slide_regions_meter = val_epoch(
                 model=model,
                 val_loader=val_loader,
                 args=args,
                 device=device,
-                arg_generator=arg_generator,
+                region_generator=region_generator,
                 dual_hg_aligner=dual_hg_aligner,
             )
 
         lr_scheduler.step(val_loss_global)
 
         if _is_main_process():
+            if args.region_mode == "none":
+                train_batch_regions_avg = "N/A"
+                train_slide_regions_avg = "N/A"
+                val_batch_regions_avg = "N/A"
+                val_slide_regions_avg = "N/A"
+            else:
+                train_batch_regions_avg = f"{train_batch_regions_meter.avg:.3f}"
+                train_slide_regions_avg = f"{train_slide_regions_meter.avg:.3f}"
+                val_batch_regions_avg = f"{val_batch_regions_meter.avg:.3f}"
+                val_slide_regions_avg = f"{val_slide_regions_meter.avg:.3f}"
+
             print(
                 f"Epoch [{epoch + 1}/{args.max_epochs}] "
                 f"train_loss(local)={train_loss.avg:.6f}, "
                 f"val_loss(local)={val_loss_local.avg:.6f}, "
-                f"val_loss(global)={val_loss_global:.6f}",
+                f"val_loss(global)={val_loss_global:.6f}, "
+                f"train_batch_regions_avg={train_batch_regions_avg}, "
+                f"train_slide_regions_avg={train_slide_regions_avg}, "
+                f"val_batch_regions_avg={val_batch_regions_avg}, "
+                f"val_slide_regions_avg={val_slide_regions_avg}",
                 flush=True,
             )
 
@@ -599,15 +946,19 @@ def main():
                 best_val_loss = val_loss_global
                 best_epoch = epoch + 1
 
+                model_state = _unwrap_model(model).state_dict()
                 ckpt: Dict[str, object] = {
                     "epoch": best_epoch,
                     "best_val_loss": best_val_loss,
-                    "model": _unwrap_model(model).state_dict(),
+                    "model": model_state,
+                    "model_state_dict": model_state,
                     "optimizer": optimizer.state_dict(),
                     "args": vars(args),
                 }
                 if dual_hg_aligner is not None:
-                    ckpt["dual_hg_aligner"] = _unwrap_model(dual_hg_aligner).state_dict()
+                    dual_hg_state = _unwrap_model(dual_hg_aligner).state_dict()
+                    ckpt["dual_hg_aligner"] = dual_hg_state
+                    ckpt["dual_hg_state_dict"] = dual_hg_state
 
                 torch.save(ckpt, os.path.join(str(args.exp_name), "best.pt"))
                 print(f"Saved Best Model at epoch {best_epoch}, val_loss={best_val_loss:.6f}", flush=True)

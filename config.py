@@ -18,6 +18,7 @@ spot_embedding = 3467 #number of shared hvgs (change for each dataset)
 pretrained = True
 trainable = True 
 temperature = 1.0
+use_spot_encoder = False
 
 # image size
 size = 224
