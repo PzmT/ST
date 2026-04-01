@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 import config as CFG
 from modules import (
@@ -13,6 +14,30 @@ from modules import (
     ImageEncoder_resnet152,
     ProjectionHead,
 )
+
+
+class GatherLayer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        if (not dist.is_available()) or (not dist.is_initialized()):
+            ctx.distributed = False
+            return (x,)
+
+        ctx.distributed = True
+        world_size = dist.get_world_size()
+        outputs = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(outputs, x)
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        if not getattr(ctx, "distributed", False):
+            return grads[0]
+
+        all_gradients = [g.contiguous() for g in grads]
+        for grad in all_gradients:
+            dist.all_reduce(grad)
+        return all_gradients[dist.get_rank()]
 
 
 class ResidualMLPBlock(nn.Module):
@@ -119,33 +144,109 @@ class BaseCLIPModel(nn.Module):
             return self.spot_encoder(reduced_expression)
         return reduced_expression
 
+    # def compute_loss(
+    #     self,
+    #     image_embeddings: torch.Tensor,
+    #     spot_embeddings: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     image_embeddings = F.normalize(image_embeddings, p=2, dim=-1)
+    #     spot_embeddings = F.normalize(spot_embeddings, p=2, dim=-1)
+
+    #     image_embeddings_all = torch.cat(GatherLayer.apply(image_embeddings), dim=0)
+    #     spot_embeddings_all = torch.cat(GatherLayer.apply(spot_embeddings), dim=0)
+
+    #     logits_per_spot = (spot_embeddings @ image_embeddings_all.T) / self.temperature
+    #     logits_per_image = (image_embeddings @ spot_embeddings_all.T) / self.temperature
+
+    #     with torch.no_grad():
+    #         images_similarity = image_embeddings @ image_embeddings_all.T
+    #         spots_similarity = spot_embeddings @ spot_embeddings_all.T
+    #         targets = F.softmax(
+    #             ((images_similarity + spots_similarity) / 2.0) / self.temperature,
+    #             dim=-1,
+    #         )
+
+    #     spots_loss = cross_entropy(logits_per_spot, targets, reduction="none")
+    #     images_loss = cross_entropy(logits_per_image, targets, reduction="none")
+    #     loss = (images_loss + spots_loss) / 2.0
+    #     return loss.mean()
+
+    # def forward(self, batch, return_features: bool = False):
+    #     image_features = self.encode_image(batch["image"])
+    #     spot_features = self.encode_spot(batch["reduced_expression"])
+
+    #     image_embeddings = self.image_projection(image_features)
+    #     spot_embeddings = self.spot_projection(spot_features)
+
+    #     loss = self.compute_loss(image_embeddings=image_embeddings, spot_embeddings=spot_embeddings)
+
+    #     if return_features:
+    #         return {
+    #             "loss": loss,
+    #             "image_features": image_features,
+    #             "spot_features": spot_features,
+    #             "image_embeddings": image_embeddings,
+    #             "spot_embeddings": spot_embeddings,
+    #         }
+    #     return loss
+
+    #changed
     def compute_loss(
         self,
         image_embeddings: torch.Tensor,
         spot_embeddings: torch.Tensor,
+        **kwargs  # 兼容 forward 传过来的 features 参数
     ) -> torch.Tensor:
-        logits = (spot_embeddings @ image_embeddings.T) / self.temperature
-        images_similarity = image_embeddings @ image_embeddings.T
-        spots_similarity = spot_embeddings @ spot_embeddings.T
+        
+        # 1. 特征 L2 归一化
+        image_embeddings = F.normalize(image_embeddings, p=2, dim=-1)
+        spot_embeddings = F.normalize(spot_embeddings, p=2, dim=-1)
 
-        targets = F.softmax(
-            ((images_similarity + spots_similarity) / 2.0) / self.temperature,
-            dim=-1,
-        )
+        # 2. 全局收集用于对比学习
+        image_embeddings_all = torch.cat(GatherLayer.apply(image_embeddings), dim=0)
+        spot_embeddings_all = torch.cat(GatherLayer.apply(spot_embeddings), dim=0)
 
-        spots_loss = cross_entropy(logits, targets, reduction="none")
-        images_loss = cross_entropy(logits.T, targets.T, reduction="none")
+        # 3. 计算跨模态预测的 Logits
+        logits_per_spot = (spot_embeddings @ image_embeddings_all.T) / self.temperature
+        logits_per_image = (image_embeddings @ spot_embeddings_all.T) / self.temperature
+
+        # ==========================================
+        # 终极修复：废弃软标签，使用 CLIP 绝对硬标签
+        # ==========================================
+        batch_size = image_embeddings.size(0)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        # DDP 下计算当前 rank 对应的正样本索引 (对角线偏移)
+        # 例如 rank 0 负责 0~31，rank 1 负责 32~63
+        labels = torch.arange(batch_size, device=image_embeddings.device) + rank * batch_size
+        
+        # 使用 PyTorch 原生的 cross_entropy，自动处理 log_softmax，数值极度稳定
+        spots_loss = F.cross_entropy(logits_per_spot, labels)
+        images_loss = F.cross_entropy(logits_per_image, labels)
+        
         loss = (images_loss + spots_loss) / 2.0
-        return loss.mean()
+        return loss
 
     def forward(self, batch, return_features: bool = False):
         image_features = self.encode_image(batch["image"])
         spot_features = self.encode_spot(batch["reduced_expression"])
+        
+        # # ====== 新增这两行调试代码 ======
+        # if torch.rand(1).item() < 0.05 and dist.get_rank() == 0:
+        #     print(f"\n[DEBUG] 图像特征方差: {image_features.std(dim=0).mean().item():.6f}")
+        #     print(f"[DEBUG] 基因特征方差: {spot_features.std(dim=0).mean().item():.6f}")
+        # # ================================
 
         image_embeddings = self.image_projection(image_features)
         spot_embeddings = self.spot_projection(spot_features)
 
-        loss = self.compute_loss(image_embeddings=image_embeddings, spot_embeddings=spot_embeddings)
+        # 核心修改：把投影前后的特征都传进 compute_loss
+        loss = self.compute_loss(
+            image_features=image_features,
+            spot_features=spot_features,
+            image_embeddings=image_embeddings, 
+            spot_embeddings=spot_embeddings
+        )
 
         if return_features:
             return {

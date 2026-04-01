@@ -1,0 +1,22 @@
+{
+  "1": {
+    "slide_id": "C73_A1",
+    "img_file": "img_embeddings_1.npy",
+    "spot_file": "spot_embeddings_1.npy"
+  },
+  "2": {
+    "slide_id": "C73_B1",
+    "img_file": "img_embeddings_2.npy",
+    "spot_file": "spot_embeddings_2.npy"
+  },
+  "3": {
+    "slide_id": "C73_C1",
+    "img_file": "img_embeddings_3.npy",
+    "spot_file": "spot_embeddings_3.npy"
+  },
+  "4": {
+    "slide_id": "C73_D1",
+    "img_file": "img_embeddings_4.npy",
+    "spot_file": "spot_embeddings_4.npy"
+  }
+}

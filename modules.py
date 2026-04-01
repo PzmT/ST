@@ -291,7 +291,9 @@ class ImageEncoder_UNI(nn.Module):
                 ) from e
 
         for p in self.model.parameters():
-            p.requires_grad = trainable
+            # p.requires_grad = trainable
+            # changed
+            p.requires_grad = False
 
         self.local_model_dir = model_dir
         self.feature_dim = int(uni_cfg.get("num_features", 1024))

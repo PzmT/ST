@@ -12,8 +12,10 @@ epochs = 10
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_name = 'resnet50'
+# model_name = 'uni'
 image_embedding = 2048
 spot_embedding = 3467 #number of shared hvgs (change for each dataset)
+# spot_embedding = 1888
 
 pretrained = True
 trainable = True 

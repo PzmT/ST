@@ -5,6 +5,8 @@ from PIL import Image
 import random
 import os
 import re
+# 新增这一行：解除 PIL 对超大病理图像的像素读取限制
+Image.MAX_IMAGE_PIXELS = None
 
 def _hflip_pil(image: Image.Image) -> Image.Image:
     return image.transpose(Image.FLIP_LEFT_RIGHT)

@@ -378,6 +378,8 @@ def _build_model(args, device: torch.device):
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
+            # find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
     return model
@@ -850,6 +852,7 @@ def main():
                 device_ids=[args.local_rank],
                 output_device=args.local_rank,
                 broadcast_buffers=False,
+                find_unused_parameters=True,
             )
 
         if _is_main_process():

@@ -1,0 +1,196 @@
+{
+  "query_slide": "3",
+  "reference_slides": [
+    "1",
+    "2",
+    "4"
+  ],
+  "methods": [
+    "simple",
+    "weighted",
+    "average"
+  ],
+  "top_k": 50,
+  "temp": 0.07,
+  "block_size": 1024,
+  "alignment_reports": {
+    "1": {
+      "slide": "1",
+      "n_spots_inferred": 2378,
+      "img_shape_raw": [
+        2378,
+        256
+      ],
+      "spot_shape_raw": [
+        2378,
+        256
+      ],
+      "expr_shape_raw": [
+        1888,
+        2378
+      ],
+      "img_shape_final": [
+        2378,
+        256
+      ],
+      "spot_shape_final": [
+        2378,
+        256
+      ],
+      "expr_shape_final": [
+        2378,
+        1888
+      ],
+      "barcode_rows": 4992
+    },
+    "2": {
+      "slide": "2",
+      "n_spots_inferred": 2349,
+      "img_shape_raw": [
+        2349,
+        256
+      ],
+      "spot_shape_raw": [
+        2349,
+        256
+      ],
+      "expr_shape_raw": [
+        1888,
+        2349
+      ],
+      "img_shape_final": [
+        2349,
+        256
+      ],
+      "spot_shape_final": [
+        2349,
+        256
+      ],
+      "expr_shape_final": [
+        2349,
+        1888
+      ],
+      "barcode_rows": 4992
+    },
+    "4": {
+      "slide": "4",
+      "n_spots_inferred": 2265,
+      "img_shape_raw": [
+        2265,
+        256
+      ],
+      "spot_shape_raw": [
+        2265,
+        256
+      ],
+      "expr_shape_raw": [
+        1888,
+        2265
+      ],
+      "img_shape_final": [
+        2265,
+        256
+      ],
+      "spot_shape_final": [
+        2265,
+        256
+      ],
+      "expr_shape_final": [
+        2265,
+        1888
+      ],
+      "barcode_rows": 4992
+    },
+    "3": {
+      "slide": "3",
+      "n_spots_inferred": 2277,
+      "img_shape_raw": [
+        2277,
+        256
+      ],
+      "spot_shape_raw": [
+        2277,
+        256
+      ],
+      "expr_shape_raw": [
+        1888,
+        2277
+      ],
+      "img_shape_final": [
+        2277,
+        256
+      ],
+      "spot_shape_final": [
+        2277,
+        256
+      ],
+      "expr_shape_final": [
+        2277,
+        1888
+      ],
+      "barcode_rows": 2277
+    }
+  },
+  "shapes": {
+    "image_query": [
+      2277,
+      256
+    ],
+    "spot_key": [
+      6992,
+      256
+    ],
+    "expression_gt": [
+      2277,
+      1888
+    ],
+    "expression_key": [
+      6992,
+      1888
+    ]
+  },
+  "metrics": {
+    "simple": {
+      "gene_wise_pcc": 0.009515897370874882,
+      "spot_wise_pcc": 0.009940815158188343,
+      "top_hvg_pcc": 0.014680514112114906,
+      "marker_gene_pcc": NaN,
+      "marker_hit_genes": [],
+      "n_query_spots": 2277,
+      "n_genes": 1888,
+      "top_hvg_n": 1000,
+      "pred_mean_gene_std_across_spots": 0.7748507261276245,
+      "true_mean_gene_std_across_spots": 0.827144205570221,
+      "pred_mean_spot_std_across_genes": 0.8093854784965515,
+      "true_mean_spot_std_across_genes": 0.8591163754463196
+    },
+    "weighted": {
+      "gene_wise_pcc": 0.0255744569003582,
+      "spot_wise_pcc": 0.03840571641921997,
+      "top_hvg_pcc": 0.03529582917690277,
+      "marker_gene_pcc": NaN,
+      "marker_hit_genes": [],
+      "n_query_spots": 2277,
+      "n_genes": 1888,
+      "top_hvg_n": 1000,
+      "pred_mean_gene_std_across_spots": 0.15024803578853607,
+      "true_mean_gene_std_across_spots": 0.827144205570221,
+      "pred_mean_spot_std_across_genes": 0.16753894090652466,
+      "true_mean_spot_std_across_genes": 0.8591163754463196
+    },
+    "average": {
+      "gene_wise_pcc": 0.025759834796190262,
+      "spot_wise_pcc": 0.03870509937405586,
+      "top_hvg_pcc": 0.035529974848032,
+      "marker_gene_pcc": NaN,
+      "marker_hit_genes": [],
+      "n_query_spots": 2277,
+      "n_genes": 1888,
+      "top_hvg_n": 1000,
+      "pred_mean_gene_std_across_spots": 0.147736057639122,
+      "true_mean_gene_std_across_spots": 0.827144205570221,
+      "pred_mean_spot_std_across_genes": 0.16464713215827942,
+      "true_mean_spot_std_across_genes": 0.8591163754463196
+    }
+  }
+}

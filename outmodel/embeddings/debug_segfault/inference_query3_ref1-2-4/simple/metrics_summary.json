@@ -1,0 +1,14 @@
+{
+  "gene_wise_pcc": 0.009515897370874882,
+  "spot_wise_pcc": 0.009940815158188343,
+  "top_hvg_pcc": 0.014680514112114906,
+  "marker_gene_pcc": NaN,
+  "marker_hit_genes": [],
+  "n_query_spots": 2277,
+  "n_genes": 1888,
+  "top_hvg_n": 1000,
+  "pred_mean_gene_std_across_spots": 0.7748507261276245,
+  "true_mean_gene_std_across_spots": 0.827144205570221,
+  "pred_mean_spot_std_across_genes": 0.8093854784965515,
+  "true_mean_spot_std_across_genes": 0.8591163754463196
+}

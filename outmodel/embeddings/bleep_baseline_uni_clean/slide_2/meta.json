@@ -1,0 +1,23 @@
+{
+  "slide": "2",
+  "slide_name": "C73_B1",
+  "n_spots": 2349,
+  "img_dim": 256,
+  "spot_dim": 256,
+  "n_genes": 3467,
+  "img_mean_std_across_spots": 0.00037382112350314856,
+  "spot_mean_std_across_spots": 0.03765608370304108,
+  "expr_mean_std_across_spots": 0.16196279227733612,
+  "first_10_barcodes": [
+    "AAACAAGTATCTCCCA-1",
+    "AAACACCAATAACTGC-1",
+    "AAACAGCTTTCAGAAG-1",
+    "AAACAGGGTCTATATT-1",
+    "AAACATTTCCCGGATT-1",
+    "AAACCCGAACGAAATC-1",
+    "AAACCGGGTAGGTACC-1",
+    "AAACCGTTCGTCCAGG-1",
+    "AAACCTCATGAAGTTG-1",
+    "AAACGAAGATGGAGTA-1"
+  ]
+}
